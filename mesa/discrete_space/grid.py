@@ -396,23 +396,34 @@ class Grid(DiscreteSpace[T]):
         """Custom __getstate__ for handling dynamic GridCell class and property_layer accessors."""
         state = super().__getstate__()
         state = {k: v for k, v in state.items() if k != "cell_klass"}
+        # Record which property_layers are read-only (their accessor has no setter)
+        # so the read-only constraint survives the pickle round trip.
+        state["_read_only_property_layers"] = {
+            name
+            for name in self.property_layers
+            if getattr(self.cell_klass, name).fset is None
+        }
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore state and re-attach property_layer accessors to the cell class."""
+        read_only_layers = state.pop("_read_only_property_layers", set())
         super().__setstate__(state)
         for name, array in self.property_layers.items():
-            setattr(
-                self.cell_klass,
-                name,
-                property(
+            if name in read_only_layers:
+                accessor = property(
+                    lambda self_cell, a=array: a[self_cell.coordinate],
+                    doc=f"property_layer '{name}'",
+                )
+            else:
+                accessor = property(
                     lambda self_cell, a=array: a[self_cell.coordinate],
                     lambda self_cell, v, a=array: a.__setitem__(
                         self_cell.coordinate, v
                     ),
                     doc=f"property_layer '{name}'",
-                ),
-            )
+                )
+            setattr(self.cell_klass, name, accessor)
 
 
 class OrthogonalMooreGrid(Grid[T]):
