@@ -55,6 +55,14 @@ class AbstractAgentSet[A: Agent](ABC, MutableSet[A]):
         """Update the AbstractAgentSet A with new set of agents."""
         ...
 
+    def __repr__(self) -> str:
+        """Return a concise, programmer-facing representation of the AbstractAgentSet."""
+        return f"<{type(self).__name__} ({len(self)} agents)>"
+
+    def __str__(self) -> str:
+        """Return a user-facing description of the AbstractAgentSet."""
+        return f"{type(self).__name__} with {len(self)} agents"
+
     def select(
         self,
         filter_func: Callable[[A], bool] | None = None,
@@ -948,3 +956,7 @@ class GroupBy:
 
     def __len__(self):  # noqa: D105
         return len(self.groups)
+
+    def __repr__(self) -> str:
+        """Return a concise representation showing the number of groups."""
+        return f"{type(self).__name__}({len(self)} groups)"

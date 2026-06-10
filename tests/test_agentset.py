@@ -725,6 +725,35 @@ def test_agentset_groupby():
     )
 
 
+def test_agentset_repr_and_str():
+    """AgentSet and its subclasses have informative repr/str showing the count."""
+    model = Model()
+    agents = [AgentTest(model) for _ in range(5)]
+
+    agentset = AgentSet(agents, random=model.random)
+    assert repr(agentset) == "<AgentSet (5 agents)>"
+    assert str(agentset) == "AgentSet with 5 agents"
+
+    # _HardKeyAgentSet uses its own class name (repr is programmer-facing).
+    hard_set = _HardKeyAgentSet(agents, random=model.random)
+    assert repr(hard_set) == "<_HardKeyAgentSet (5 agents)>"
+    assert str(hard_set) == "_HardKeyAgentSet with 5 agents"
+
+    # Count reflects the actual size, including empty sets.
+    empty = AgentSet([], random=model.random)
+    assert repr(empty) == "<AgentSet (0 agents)>"
+
+
+def test_groupby_repr():
+    """GroupBy has a repr showing the number of groups."""
+    model = Model()
+    agents = [AgentTest(model) for _ in range(6)]
+    grouped = AgentSet(agents, random=model.random).groupby(
+        lambda a: a.unique_id % 3
+    )
+    assert repr(grouped) == "GroupBy(3 groups)"
+
+
 def test_hardkeyagentset_init():
     """Test _HardKeyAgentSet initialization and storage."""
     model = Model()
