@@ -748,9 +748,7 @@ def test_groupby_repr():
     """GroupBy has a repr showing the number of groups."""
     model = Model()
     agents = [AgentTest(model) for _ in range(6)]
-    grouped = AgentSet(agents, random=model.random).groupby(
-        lambda a: a.unique_id % 3
-    )
+    grouped = AgentSet(agents, random=model.random).groupby(lambda a: a.unique_id % 3)
     assert repr(grouped) == "GroupBy(3 groups)"
 
 
