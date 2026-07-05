@@ -1,6 +1,7 @@
 """Tests for mesa.experimental.scenarios."""
 
 import pickle
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from mesa.experimental.data_collection import DataRecorder
 from mesa.experimental.scenarios import (
     RunConfiguration,
     Scenario,
+    ScenarioAbortedException,
     ScenarioFailedException,
     ScenarioNotFoundException,
     ScenarioNotReadyException,
@@ -46,7 +48,7 @@ def test_scenario():
     d = scenario.to_dict()
     assert d["a"] == 1
     assert d["scenario_id"] == 0
-    assert d["replication_id"] == PARENT_REPLICATION_ID
+    assert d["replication_id"] is PARENT_REPLICATION_ID
 
     with pytest.raises(TypeError):
         scenario.c = 4
@@ -454,6 +456,45 @@ class _FailingWriter:
         raise OSError("disk full")
 
 
+class _WorkerKillModel(Model):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.data_recorder = _DummyRecorder()
+
+    def run_until(self, until):
+        import os  # noqa: PLC0415
+
+        os._exit(1)  # hard-kills the worker; not catchable by _safe_call
+
+
+class _ConditionalKillModel(Model):
+    """Kills the worker for any scenario with should_kill=True; otherwise runs normally."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.data_recorder = _DummyRecorder()
+
+    def run_until(self, until):
+        if getattr(self.scenario, "should_kill", False):
+            import os  # noqa: PLC0415
+
+            os._exit(1)
+        super().run_until(until)
+
+
+class _ConditionalConfig(RunConfiguration):
+    """Fails the run for any scenario flagged should_fail.
+
+    Module-level (not a local class inside a test) so it pickles to process
+    workers when the parallel backend runs it.
+    """
+
+    def run_model(self, model):
+        if getattr(model.scenario, "should_fail", False):
+            raise RuntimeError("intentional")
+        super().run_model(model)
+
+
 @pytest.fixture
 def basic_config():
     """Basic scenario configuration."""
@@ -472,6 +513,16 @@ def populated_store(scenario_list):
     store = InMemoryStore()
     store.write_scenarios(scenario_list)
     return store, scenario_list
+
+
+@pytest.fixture(params=["sequential", "process"])
+def maybe_executor(request):
+    """Fixture controlling the executor to use."""
+    if request.param == "sequential":
+        yield None
+    else:
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            yield ex
 
 
 # ============================================================
@@ -540,6 +591,20 @@ def test_store_mark_failed(populated_store):
     assert exc_info.value.failure is failure
 
 
+def test_store_mark_aborted(populated_store):
+    """Test storing marked aborted scenarios."""
+    store, scenarios = populated_store
+    run_id = RunId(scenarios[0].scenario_id, scenarios[0].replication_id)
+    failure = FailureInfo(FailureOrigin.ABORTED, "BrokenProcessPool", "pool died", "tb")
+    store.mark_aborted(run_id, failure)
+
+    assert store.check_status(run_id) == Status.ABORTED
+    with pytest.raises(ScenarioAbortedException) as exc_info:
+        store.retrieve_output(run_id)
+    assert exc_info.value.run_id == run_id
+    assert exc_info.value.failure is failure
+
+
 def test_store_unknown_run_id_raises():
     """Test the unknown run_id raises exception."""
     store = InMemoryStore()
@@ -558,7 +623,7 @@ def test_store_status_dataframe(populated_store):
 
 
 def test_store_status_dataframe_mixed_case(populated_store):
-    """Test the status dataframe store with a mix of successes and failures."""
+    """Test the status dataframe store with a mix of statuses."""
     store, scenarios = populated_store
     writer = store.writer()
 
@@ -570,6 +635,7 @@ def test_store_status_dataframe_mixed_case(populated_store):
     store.mark_failed(run_id_1, FailureInfo(FailureOrigin.RUNNING, "E", "m", ""))
 
     df = store.status()
+    # pandas converts None replication_id to NaN in the MultiIndex, so look up by scenario_id
     assert df.index.get_level_values("replication_id").dtype == np.int64
     assert df.loc[(s0.scenario_id, s0.replication_id), "status"] == "SUCCEEDED"
     assert df.loc[(s1.scenario_id, s1.replication_id), "status"] == "FAILED"
@@ -592,6 +658,24 @@ def test_store_filter_methods(populated_store):
     assert set(store.succeeded()) == {run_id_0}
     assert set(store.failed()) == {run_id_1}
     assert set(store.pending()) == {run_id_2}
+    assert set(store.aborted()) == set()
+
+
+def test_store_aborted_filter(populated_store):
+    """Test the aborted() filter on InMemoryStore."""
+    store, scenarios = populated_store
+    s0, _, s2 = scenarios
+    run_id_0 = RunId(s0.scenario_id, s0.replication_id)
+    run_id_2 = RunId(s2.scenario_id, s2.replication_id)
+
+    store.mark_aborted(
+        run_id_0,
+        FailureInfo(FailureOrigin.ABORTED, "BrokenProcessPool", "pool died", "tb"),
+    )
+
+    assert set(store.aborted()) == {run_id_0}
+    assert run_id_0 not in store.pending()
+    assert run_id_2 in store.pending()
 
 
 # ============================================================
@@ -659,11 +743,14 @@ def test_safe_call_writer_failure(basic_config):
 # ============================================================
 
 
-def test_run_scenarios_all_succeed():
+def test_run_scenarios_all_succeed(maybe_executor):
     """Test the successful branch of run_scenarios."""
     scenarios = [Scenario(x=i) for i in range(4)]
     store = run_scenarios(
-        scenarios, RunConfiguration(_DummyModel, until=3), progress=False
+        scenarios,
+        RunConfiguration(_DummyModel, until=3),
+        progress=False,
+        executor=maybe_executor,
     )
 
     assert len(store.succeeded()) == 4
@@ -677,18 +764,19 @@ def test_run_scenarios_all_succeed():
         assert "results" in output
 
 
-def test_run_scenarios_partial_failure():
-    """Test run_scenarios with a mix of successes and failures."""
+def test_run_scenarios_partial_failure(maybe_executor):
+    """A failing run becomes a recorded FailureInfo while the rest succeed.
+
+    Parametrized over sequential and process backends: under the process pool
+    this proves a worker-raised failure pickles home and attributes to the
+    correct RunId, not just that the sequential path records it.
+    """
     scenarios = [Scenario(x=i, should_fail=(i == 1)) for i in range(3)]
-
-    class _ConditionalConfig(RunConfiguration):
-        def run_model(self, model):
-            if getattr(model.scenario, "should_fail", False):
-                raise RuntimeError("intentional")
-            super().run_model(model)
-
     store = run_scenarios(
-        scenarios, _ConditionalConfig(_DummyModel, until=3), progress=False
+        scenarios,
+        _ConditionalConfig(_DummyModel, until=3),
+        progress=False,
+        executor=maybe_executor,
     )
 
     assert len(store.succeeded()) == 2
@@ -719,6 +807,101 @@ def test_run_scenarios_empty_input():
     assert len(store.failed()) == 0
 
 
+def test_run_scenarios_aborts_on_broken_pool():
+    """A hard worker death aborts every unrun scenario and does not raise.
+
+    Every _WorkerKillModel calls os._exit on run, so no run can complete: the
+    pool breaks on the first future and all four runs flip PENDING -> ABORTED.
+    Asserting the exact partition (4 aborted, 0 of everything else) distinguishes
+    correct bulk-marking from a partial-marking bug that == 4 catches but > 0
+    would not.
+    """
+    scenarios = [Scenario(x=i) for i in range(4)]
+    with ProcessPoolExecutor(max_workers=2) as ex:
+        store = run_scenarios(
+            scenarios,
+            RunConfiguration(_WorkerKillModel, until=3),
+            executor=ex,
+            progress=False,
+        )
+
+    # returns, does not raise
+    assert len(store.aborted()) == 4
+    assert len(store.succeeded()) == 0
+    assert len(store.failed()) == 0
+    assert len(store.pending()) == 0
+
+    for rec in store.aborted().values():
+        assert rec.failure.origin is FailureOrigin.ABORTED
+
+
+def test_run_scenarios_partial_abort():
+    """Runs that finish before the pool breaks are SUCCEEDED; the rest become ABORTED.
+
+    With max_workers=1 the pool processes tasks in submission order. Scenario 0
+    completes successfully before scenario 1 starts. Scenario 1 kills the worker,
+    so its future surfaces as BrokenExecutor before _record can mark it — leaving
+    scenarios 1, 2, and 3 all PENDING when the outer handler fires. All three
+    become ABORTED.
+    """
+    scenarios = [
+        Scenario(x=0, should_kill=False),
+        Scenario(x=1, should_kill=True),
+        Scenario(x=2, should_kill=False),
+        Scenario(x=3, should_kill=False),
+    ]
+    with ProcessPoolExecutor(max_workers=1) as ex:
+        store = run_scenarios(
+            scenarios,
+            RunConfiguration(_ConditionalKillModel, until=3),
+            executor=ex,
+            progress=False,
+        )
+
+    assert len(store.succeeded()) == 1
+    assert len(store.aborted()) == 3
+    assert len(store.failed()) == 0
+    assert len(store.pending()) == 0
+
+    succeeded_id = RunId(scenarios[0].scenario_id, scenarios[0].replication_id)
+    assert succeeded_id in store.succeeded()
+    for rec in store.aborted().values():
+        assert rec.failure.origin is FailureOrigin.ABORTED
+
+
+def test_run_scenarios_handles_result_transport_error():
+    """A non-BrokenExecutor error from future.result() records the run as failed and continues.
+
+    This exercises the inner except-Exception branch in the executor path, which
+    handles pickling failures or CancelledError on the return trip from a worker.
+    A pre-failed Future simulates that condition without spawning real processes.
+    """
+    from concurrent.futures import Future  # noqa: PLC0415
+
+    class _TransportErrorExecutor:
+        def submit(self, fn, *args, **kwargs):
+            f = Future()
+            f.set_exception(RuntimeError("simulated transport error"))
+            return f
+
+    scenarios = [Scenario(x=i) for i in range(2)]
+    store = run_scenarios(
+        scenarios,
+        RunConfiguration(_DummyModel, until=3),
+        executor=_TransportErrorExecutor(),
+        progress=False,
+    )
+
+    assert len(store.failed()) == 2
+    assert len(store.succeeded()) == 0
+    assert len(store.pending()) == 0
+    assert len(store.aborted()) == 0
+    for rec in store.failed().values():
+        assert rec.failure.origin == FailureOrigin.WRITING
+        assert rec.failure.exception_type == "RuntimeError"
+        assert "transport error" in rec.failure.message
+
+
 # ============================================================
 # Exception constructors
 # ============================================================
@@ -739,6 +922,17 @@ def test_run_scenarios_empty_input():
                 "run_id": RunId(4, 2),
                 "failure": FailureInfo(
                     FailureOrigin.RUNNING, "RuntimeError", "boom", "tb"
+                ),
+            },
+        ),
+        (ScenarioAbortedException, {}),
+        (ScenarioAbortedException, {"run_id": RunId(5, 0)}),
+        (
+            ScenarioAbortedException,
+            {
+                "run_id": RunId(6, 1),
+                "failure": FailureInfo(
+                    FailureOrigin.ABORTED, "BrokenProcessPool", "pool died", "tb"
                 ),
             },
         ),
@@ -763,6 +957,21 @@ def test_scenario_failed_exception_message_includes_failure_detail():
     assert "extracting" in str(exc)
     assert "KeyError" in str(exc)
     assert "missing key" in str(exc)
+    assert exc.failure is failure
+
+
+def test_scenario_aborted_exception_message_includes_failure_detail():
+    """Test scenario aborted exception message including failure detail."""
+    failure = FailureInfo(
+        origin=FailureOrigin.ABORTED,
+        exception_type="BrokenProcessPool",
+        message="worker died",
+        traceback="...",
+    )
+    exc = ScenarioAbortedException(run_id=RunId(5, 0), failure=failure)
+    assert "aborted" in str(exc)
+    assert "BrokenProcessPool" in str(exc)
+    assert "worker died" in str(exc)
     assert exc.failure is failure
 
 

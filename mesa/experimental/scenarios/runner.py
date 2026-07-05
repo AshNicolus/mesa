@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import traceback
 from collections.abc import Iterable
+from concurrent.futures import BrokenExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -231,6 +232,39 @@ def run_scenarios(
         for scenario in _bar(scenarios):
             _record(scenario, _safe_call(config, scenario, writer))
     else:
-        raise NotImplementedError(f"Executor {executor} is not implemented")
-
+        futures = {
+            executor.submit(_safe_call, config, scenario, writer): scenario
+            for scenario in scenarios
+        }
+        try:
+            for future in _bar(as_completed(futures)):
+                scenario = futures[future]
+                try:
+                    result = future.result()
+                except BrokenExecutor:
+                    raise
+                except Exception as e:
+                    # pickling failure or CancelledError on the return trip; record as failed and continue
+                    result = (
+                        None,
+                        FailureInfo(
+                            origin=FailureOrigin.WRITING,
+                            exception_type=type(e).__name__,
+                            message=str(e),
+                            traceback="".join(traceback.format_exception(e)),
+                        ),
+                    )
+                _record(scenario, result)
+        except BrokenExecutor as e:
+            cause = e.__cause__ or e
+            for entry in list(store.pending()):
+                store.mark_aborted(
+                    entry,
+                    FailureInfo(
+                        origin=FailureOrigin.ABORTED,
+                        exception_type=type(cause).__name__,
+                        message=str(cause),
+                        traceback="".join(traceback.format_exception(e)),
+                    ),
+                )
     return store
