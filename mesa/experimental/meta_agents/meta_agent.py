@@ -97,7 +97,6 @@ def find_combinations(
         evaluation_func: The function to evaluate combinations. Defaults to None.
         filter_func: Allows the user to specify how agents are filtered to form groups.
           Defaults to None.
-        List: The function to filter combinations. Defaults to None.
 
     Returns:
         List: The list of valuable combinations, in a tuple first agentset of valuable combination  and then the value of
