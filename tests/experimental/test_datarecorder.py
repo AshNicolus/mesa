@@ -496,6 +496,10 @@ def test_json_recorder_numpy_encoder_types():
     arr = np.array([1, 2, 3])
     assert encoder.default(arr) == [1, 2, 3]
 
+    # Unsupported types fall through to the base encoder, which raises.
+    with pytest.raises(TypeError):
+        encoder.default(object())
+
 
 def test_json_recorder_clear():
     """Test JSONDataRecorder clear functionality."""
